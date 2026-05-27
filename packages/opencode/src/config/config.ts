@@ -281,7 +281,7 @@ export const Info = Schema.Struct({
         description: "Maximum number of tokens from recent turns to preserve verbatim after compaction",
       }),
       openai_responses: Schema.optional(Schema.Boolean).annotate({
-        description: "Use OpenAI Responses API /responses/compact for OpenAI compaction (default: false)",
+        description: "Use OpenAI Responses API /responses/compact for OpenAI compaction (default: true)",
       }),
       reserved: Schema.optional(NonNegativeInt).annotate({
         description: "Token buffer for compaction. Leaves enough window to avoid overflow during compaction.",

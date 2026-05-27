@@ -849,7 +849,7 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
-    "uses OpenAI Responses compact endpoint when configured",
+    "uses OpenAI Responses compact endpoint by default",
     () => {
       const requests: Array<{ url: string; authorization: string | undefined; body: unknown }> = []
       const model = ProviderTest.model({
@@ -947,7 +947,7 @@ describe("session.compaction.process", () => {
         expect(replay?.providerOptions?.openai?.compactionOutput).toEqual([
           { id: "cmp_1", type: "compaction_summary", encrypted_content: "encrypted-state" },
         ])
-      }).pipe(withCompaction({ config: cfg({ openai_responses: true }), provider }))
+      }).pipe(withCompaction({ config: cfg(), provider }))
     },
   )
 

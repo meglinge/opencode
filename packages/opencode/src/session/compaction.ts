@@ -701,7 +701,7 @@ export const layer = Layer.effect(
         { sessionID: input.sessionID },
         { context: [], prompt: undefined },
       )
-      if (cfg.compaction?.openai_responses) {
+      if (cfg.compaction?.openai_responses !== false) {
         const compacted = yield* runOpenAIResponsesCompaction({
           sessionID: input.sessionID,
           messages: history.filter((_, index) => !hidden.has(index)),
