@@ -57,6 +57,31 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
+  it.effect("replays compacted OpenAI Responses output items", () =>
+    Effect.gen(function* () {
+      const prepared = yield* LLMClient.prepare<OpenAIResponses.OpenAIResponsesBody>(
+        LLM.request({
+          model,
+          messages: [
+            Message.assistant({
+              type: "reasoning",
+              text: "",
+              providerMetadata: {
+                openai: {
+                  compactionOutput: [{ id: "cmp_1", type: "compaction_summary", encrypted_content: "encrypted-state" }],
+                },
+              },
+            }),
+          ],
+        }),
+      )
+
+      expect(prepared.body.input).toEqual([
+        { id: "cmp_1", type: "compaction_summary", encrypted_content: "encrypted-state" },
+      ])
+    }),
+  )
+
   it.effect("prepares OpenAI Responses WebSocket target", () =>
     Effect.gen(function* () {
       const prepared = yield* LLMClient.prepare(

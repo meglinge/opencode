@@ -1107,6 +1107,98 @@ describe("session.llm.stream", () => {
   )
 
   it.instance(
+    "forces native OpenAI Responses when compacted state is present",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const resolved = yield* Provider.use.getModel(ProviderID.openai, ModelID.make(model.id))
+        const sessionID = SessionID.make("session-test-native-compaction")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        let nativeCalled = false
+        const nativeClient = Layer.succeed(
+          LLMClient.Service,
+          LLMClient.Service.of({
+            prepare: () => Effect.die(new Error("unexpected native prepare")),
+            generate: () => Effect.die(new Error("unexpected native generate")),
+            stream: (input: unknown) => {
+              nativeCalled = true
+              if (!input || typeof input !== "object" || !("request" in input)) {
+                throw new Error("expected tool runtime native request")
+              }
+              const request = input.request as { messages: Array<{ content: unknown[] }> }
+              expect(request.messages).toHaveLength(3)
+              expect(request.messages[1]?.content[0]).toMatchObject({
+                type: "reasoning",
+                providerMetadata: {
+                  openai: {
+                    compactionOutput: [
+                      { id: "cmp_1", type: "compaction_summary", encrypted_content: "encrypted-state" },
+                    ],
+                  },
+                },
+              })
+              return Stream.empty
+            },
+          }),
+        )
+
+        yield* drainWith(
+          LLM.layer.pipe(
+            Layer.provide(Auth.defaultLayer),
+            Layer.provide(Config.defaultLayer),
+            Layer.provide(Provider.defaultLayer),
+            Layer.provide(Plugin.defaultLayer),
+            Layer.provide(nativeClient),
+            Layer.provide(RuntimeFlags.layer({ experimentalNativeLlm: false })),
+          ),
+          {
+            user: {
+              id: MessageID.make("msg_user-native-compaction"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderID.make("openai"), modelID: resolved.id, variant: "high" },
+            } satisfies MessageV2.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: ["You are a helpful assistant."],
+            messages: [
+              { role: "user", content: "before compaction" },
+              {
+                role: "assistant",
+                content: [
+                  {
+                    type: "reasoning",
+                    text: "",
+                    providerOptions: {
+                      openai: {
+                        compactionOutput: [
+                          { id: "cmp_1", type: "compaction_summary", encrypted_content: "encrypted-state" },
+                        ],
+                      },
+                    },
+                  },
+                ],
+              },
+              { role: "user", content: "continue" },
+            ],
+            tools: {},
+          },
+        )
+
+        expect(nativeCalled).toBe(true)
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  it.instance(
     "streams OpenAI through native runtime when opted in",
     () =>
       Effect.gen(function* () {

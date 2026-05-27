@@ -849,6 +849,109 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
+    "uses OpenAI Responses compact endpoint when configured",
+    () => {
+      const requests: Array<{ url: string; authorization: string | undefined; body: unknown }> = []
+      const model = ProviderTest.model({
+        id: ModelID.make("gpt-5.2"),
+        providerID: ProviderID.openai,
+        api: { id: "gpt-5.2", url: "https://api.openai.test/v1", npm: "@ai-sdk/openai" },
+      })
+      const fetchCompact: typeof globalThis.fetch = Object.assign(
+        async (input: Parameters<typeof globalThis.fetch>[0], init?: Parameters<typeof globalThis.fetch>[1]) => {
+          requests.push({
+            url: input instanceof Request ? input.url : input.toString(),
+            authorization: new Headers(init?.headers).get("authorization") ?? undefined,
+            body: JSON.parse(String(init?.body)),
+          })
+          return new Response(
+            JSON.stringify({
+              id: "resp_compact_1",
+              object: "response.compaction",
+              created_at: 1,
+              output: [{ id: "cmp_1", type: "compaction_summary", encrypted_content: "encrypted-state" }],
+              usage: {
+                input_tokens: 10,
+                input_tokens_details: { cached_tokens: 2 },
+                output_tokens: 4,
+                output_tokens_details: { reasoning_tokens: 1 },
+                total_tokens: 14,
+              },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          )
+        },
+        { preconnect: globalThis.fetch.preconnect },
+      )
+      const provider = ProviderTest.fake({
+        model,
+        info: ProviderTest.info({ id: ProviderID.openai, options: { apiKey: "test-key", fetch: fetchCompact } }, model),
+      })
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "hello")
+        yield* SessionCompaction.use.create({
+          sessionID: session.id,
+          agent: "build",
+          model: { providerID: ProviderID.openai, modelID: model.id },
+          auto: false,
+        })
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const parent = msgs.at(-1)?.info.id
+        expect(parent).toBeTruthy()
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: parent!,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        const all = yield* ssn.messages({ sessionID: session.id })
+        const marker = all
+          .find((item) => item.info.id === parent)
+          ?.parts.find((part): part is MessageV2.CompactionPart => part.type === "compaction")
+        const summary = all.find((item) => item.info.role === "assistant" && item.info.summary)
+        const state = summary?.parts.find((part): part is MessageV2.ReasoningPart => part.type === "reasoning")
+
+        expect(result).toBe("continue")
+        expect(requests).toHaveLength(1)
+        expect(requests[0]?.url).toBe("https://api.openai.test/v1/responses/compact")
+        expect(requests[0]?.authorization).toBe("Bearer test-key")
+        expect(requests[0]?.body).toMatchObject({ model: "gpt-5.2" })
+        expect(JSON.stringify(requests[0]?.body)).toContain("hello")
+        expect(marker?.method).toBe("openai_responses")
+        expect(marker?.tail_start_id).toBeUndefined()
+        expect(summary?.info.role).toBe("assistant")
+        if (summary?.info.role === "assistant") {
+          expect(summary.info.finish).toBe("stop")
+          expect(summary.info.tokens).toEqual({
+            total: 14,
+            input: 8,
+            output: 3,
+            reasoning: 1,
+            cache: { read: 2, write: 0 },
+          })
+        }
+        expect(state?.metadata?.openai?.compactionOutput).toEqual([
+          { id: "cmp_1", type: "compaction_summary", encrypted_content: "encrypted-state" },
+        ])
+        const filtered = MessageV2.filterCompacted(MessageV2.stream(session.id))
+        const modelMessages = yield* MessageV2.toModelMessagesEffect(filtered, model)
+        const replay = modelMessages
+          .flatMap((item): unknown[] => (Array.isArray(item.content) ? [...item.content] : []))
+          .find((item) => typeof item === "object" && item !== null && "type" in item && item.type === "reasoning") as
+          | { providerOptions?: { openai?: { compactionOutput?: unknown } } }
+          | undefined
+        expect(replay?.providerOptions?.openai?.compactionOutput).toEqual([
+          { id: "cmp_1", type: "compaction_summary", encrypted_content: "encrypted-state" },
+        ])
+      }).pipe(withCompaction({ config: cfg({ openai_responses: true }), provider }))
+    },
+  )
+
+  itCompaction.instance(
     "marks summary message as errored on compact result",
     Effect.gen(function* () {
       const ssn = yield* SessionNs.Service

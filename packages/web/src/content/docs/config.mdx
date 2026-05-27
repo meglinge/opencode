@@ -707,6 +707,7 @@ You can control context compaction behavior through the `compaction` option.
   "compaction": {
     "auto": true,
     "prune": true,
+    "openai_responses": false,
     "reserved": 10000
   }
 }
@@ -714,6 +715,7 @@ You can control context compaction behavior through the `compaction` option.
 
 - `auto` - Automatically compact the session when context is full (default: `true`).
 - `prune` - Remove old tool outputs to save tokens (default: `true`).
+- `openai_responses` - Use OpenAI's Responses API `/responses/compact` endpoint for OpenAI model compaction. The compacted state is encrypted and opaque rather than a readable Markdown summary (default: `false`).
 - `reserved` - Token buffer for compaction. Leaves enough window to avoid overflow during compaction
 
 ---

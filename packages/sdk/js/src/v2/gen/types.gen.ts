@@ -717,6 +717,7 @@ export type CompactionPart = {
   type: "compaction"
   auto: boolean
   overflow?: boolean
+  method?: "openai_responses"
   tail_start_id?: string
 }
 
@@ -1303,6 +1304,7 @@ export type Config = {
     prune?: boolean
     tail_turns?: number
     preserve_recent_tokens?: number
+    openai_responses?: boolean
     reserved?: number
   }
   experimental?: {

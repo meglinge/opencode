@@ -26,9 +26,31 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { isRecord } from "@/util/record"
 
 const log = Log.create({ service: "llm" })
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
+
+function openAIProviderMetadata(part: Record<string, unknown>) {
+  const metadata = isRecord(part.providerMetadata)
+    ? part.providerMetadata
+    : isRecord(part.providerOptions)
+      ? part.providerOptions
+      : undefined
+  if (!metadata) return undefined
+  return isRecord(metadata.openai) ? metadata.openai : undefined
+}
+
+function requiresNativeOpenAIResponses(messages: ModelMessage[]) {
+  return messages.some((message) => {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) return false
+    const content: readonly unknown[] = message.content
+    return content.some((part) => {
+      if (!isRecord(part) || part.type !== "reasoning") return false
+      return Array.isArray(openAIProviderMetadata(part)?.compactionOutput)
+    })
+  })
+}
 
 export type StreamInput = {
   user: MessageV2.User
@@ -215,9 +237,13 @@ const live: Layer.Layer<
           })
         : undefined
 
+      const needsNativeOpenAIResponses = requiresNativeOpenAIResponses(prepared.messages)
       // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
       // either returns a ready LLMEvent stream or a concrete fallback reason.
-      if (flags.experimentalNativeLlm) {
+      // OpenAI Responses compaction state is a provider-native input item, so
+      // it must also use the native Responses adapter even when native LLM is
+      // not globally enabled.
+      if (flags.experimentalNativeLlm || needsNativeOpenAIResponses) {
         const native = LLMNativeRuntime.stream({
           model: input.model,
           provider: item,
@@ -246,6 +272,9 @@ const live: Layer.Layer<
             type: "native" as const,
             stream: native.stream,
           }
+        }
+        if (needsNativeOpenAIResponses) {
+          throw new Error(`OpenAI Responses compaction requires native OpenAI runtime: ${native.reason}`)
         }
         yield* Effect.logInfo("llm runtime selected").pipe(
           Effect.annotateLogs({

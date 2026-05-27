@@ -186,6 +186,7 @@ export const CompactionPart = Schema.Struct({
   type: Schema.Literal("compaction"),
   auto: Schema.Boolean,
   overflow: Schema.optional(Schema.Boolean),
+  method: Schema.optional(Schema.Literal("openai_responses")),
   tail_start_id: Schema.optional(MessageID),
 }).annotate({ identifier: "CompactionPart" })
 export type CompactionPart = Types.DeepMutable<Schema.Schema.Type<typeof CompactionPart>>
@@ -723,7 +724,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
           }
         }
 
-        if (part.type === "compaction") {
+        if (part.type === "compaction" && part.method !== "openai_responses") {
           userMessage.parts.push({
             type: "text",
             text: "What did we do so far?",
@@ -866,11 +867,13 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
               })
             continue
           }
-          assistantMessage.parts.push({
-            type: "reasoning",
+          const reasoning = {
+            type: "reasoning" as const,
             text: part.text,
             providerMetadata: part.metadata,
-          })
+          }
+          if (part.metadata) Object.assign(reasoning, { providerOptions: part.metadata })
+          assistantMessage.parts.push(reasoning)
         }
       }
       if (assistantMessage.parts.length > 0) {

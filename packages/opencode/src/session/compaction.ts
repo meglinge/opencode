@@ -20,6 +20,11 @@ import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionEvent } from "@opencode-ai/core/session-event"
+import { Usage } from "@opencode-ai/llm"
+import { OpenAIResponses } from "@opencode-ai/llm/protocols/openai-responses"
+import { ProviderTransform } from "@/provider/transform"
+import { LLMNative } from "./llm/native-request"
+import { isRecord } from "@/util/record"
 
 const log = Log.create({ service: "session.compaction" })
 
@@ -39,6 +44,7 @@ const PRUNE_PROTECTED_TOOLS = ["skill"]
 const DEFAULT_TAIL_TURNS = 2
 const MIN_PRESERVE_RECENT_TOKENS = 2_000
 const MAX_PRESERVE_RECENT_TOKENS = 8_000
+const OPENAI_RESPONSES_COMPACTION_TEXT = "Context compacted with OpenAI Responses encrypted state."
 const SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
 <template>
 ## Goal
@@ -139,6 +145,48 @@ function preserveRecentBudget(input: { cfg: Config.Info; model: Provider.Model }
     Math.min(MAX_PRESERVE_RECENT_TOKENS, Math.max(MIN_PRESERVE_RECENT_TOKENS, Math.floor(usable(input) * 0.25)))
   )
 }
+
+function supportsOpenAIResponsesCompaction(model: Provider.Model) {
+  return model.providerID === ProviderID.openai && model.api.npm === "@ai-sdk/openai"
+}
+
+function providerHeaders(value: unknown) {
+  if (!isRecord(value)) return {}
+  return Object.fromEntries(
+    Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  )
+}
+
+function providerFetch(value: unknown) {
+  return typeof value === "function" ? (value as typeof globalThis.fetch) : fetch
+}
+
+function openAIBaseURL(info: Provider.Info, model: Provider.Model) {
+  if (typeof info.options.baseURL === "string" && info.options.baseURL.trim() !== "") return info.options.baseURL
+  if (model.api.url) return model.api.url
+  return OpenAIResponses.DEFAULT_BASE_URL
+}
+
+function openAIAPIKey(info: Provider.Info) {
+  return typeof info.options.apiKey === "string" ? info.options.apiKey : info.key
+}
+
+function compactEndpoint(baseURL: string) {
+  return `${baseURL.replace(/\/+$/, "")}/responses/compact`
+}
+
+function compactUsage(input: OpenAIResponses.OpenAIResponsesCompactResponse) {
+  return new Usage({
+    inputTokens: input.usage?.input_tokens,
+    outputTokens: input.usage?.output_tokens,
+    cacheReadInputTokens: input.usage?.input_tokens_details?.cached_tokens,
+    reasoningTokens: input.usage?.output_tokens_details?.reasoning_tokens,
+    totalTokens: input.usage?.total_tokens,
+    providerMetadata: input.usage ? { openai: input.usage } : undefined,
+  })
+}
+
+const decodeCompactResponseText = Schema.decodeUnknownEffect(Schema.fromJsonString(OpenAIResponses.OpenAIResponsesCompactResponse))
 
 function turns(messages: MessageV2.WithParts[]) {
   const result: Turn[] = []
@@ -341,6 +389,259 @@ export const layer = Layer.effect(
       }
     })
 
+    const createSummaryMessage = Effect.fn("SessionCompaction.createSummaryMessage")(function* (input: {
+      parentID: MessageID
+      sessionID: SessionID
+      userMessage: MessageV2.User
+      model: Provider.Model
+    }) {
+      const ctx = yield* InstanceState.context
+      const message: MessageV2.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: input.parentID,
+        sessionID: input.sessionID,
+        mode: "compaction",
+        agent: "compaction",
+        variant: input.userMessage.model.variant,
+        summary: true,
+        path: {
+          cwd: ctx.directory,
+          root: ctx.worktree,
+        },
+        cost: 0,
+        tokens: {
+          output: 0,
+          input: 0,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        },
+        modelID: input.model.id,
+        providerID: input.model.providerID,
+        time: {
+          created: Date.now(),
+        },
+      }
+      return yield* session.updateMessage(message)
+    })
+
+    const publishCompacted = Effect.fn("SessionCompaction.publishCompacted")(function* (input: {
+      sessionID: SessionID
+      summary: string | undefined
+      include: MessageID | undefined
+    }) {
+      if (flags.experimentalEventSystem) {
+        yield* events.publish(SessionEvent.Compaction.Ended, {
+          sessionID: input.sessionID,
+          timestamp: DateTime.makeUnsafe(Date.now()),
+          text: input.summary ?? "",
+          include: input.include,
+        })
+      }
+      yield* bus.publish(Event.Compacted, { sessionID: input.sessionID })
+    })
+
+    const autoContinue = Effect.fn("SessionCompaction.autoContinue")(function* (input: {
+      sessionID: SessionID
+      userMessage: MessageV2.User
+      auto: boolean
+      overflow?: boolean
+      replay?: { info: MessageV2.User; parts: MessageV2.Part[] }
+    }) {
+      if (!input.auto) return
+      if (input.replay) {
+        const original = input.replay.info
+        const replayMsg = yield* session.updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          sessionID: input.sessionID,
+          time: { created: Date.now() },
+          agent: original.agent,
+          model: original.model,
+          format: original.format,
+          tools: original.tools,
+          system: original.system,
+        })
+        for (const part of input.replay.parts) {
+          if (part.type === "compaction") continue
+          const replayPart =
+            part.type === "file" && MessageV2.isMedia(part.mime)
+              ? { type: "text" as const, text: `[Attached ${part.mime}: ${part.filename ?? "file"}]` }
+              : part
+          yield* session.updatePart({
+            ...replayPart,
+            id: PartID.ascending(),
+            messageID: replayMsg.id,
+            sessionID: input.sessionID,
+          })
+        }
+        return
+      }
+
+      const info = yield* provider.getProvider(input.userMessage.model.providerID)
+      if (
+        !(yield* plugin.trigger(
+          "experimental.compaction.autocontinue",
+          {
+            sessionID: input.sessionID,
+            agent: input.userMessage.agent,
+            model: yield* provider.getModel(input.userMessage.model.providerID, input.userMessage.model.modelID).pipe(Effect.orDie),
+            provider: {
+              source: info.source,
+              info,
+              options: info.options,
+            },
+            message: input.userMessage,
+            overflow: input.overflow === true,
+          },
+          { enabled: true },
+        )).enabled
+      ) {
+        return
+      }
+
+      const continueMsg = yield* session.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: input.sessionID,
+        time: { created: Date.now() },
+        agent: input.userMessage.agent,
+        model: input.userMessage.model,
+      })
+      const text =
+        (input.overflow
+          ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
+          : "") + "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        messageID: continueMsg.id,
+        sessionID: input.sessionID,
+        type: "text",
+        // Internal marker for auto-compaction followups so provider plugins
+        // can distinguish them from manual post-compaction user prompts.
+        // This is not a stable plugin contract and may change or disappear.
+        metadata: { compaction_continue: true },
+        synthetic: true,
+        text,
+        time: {
+          start: Date.now(),
+          end: Date.now(),
+        },
+      })
+    })
+
+    const runOpenAIResponsesCompaction = Effect.fn("SessionCompaction.runOpenAIResponsesCompaction")(function* (input: {
+      sessionID: SessionID
+      messages: MessageV2.WithParts[]
+      model: Provider.Model
+    }) {
+      if (!supportsOpenAIResponsesCompaction(input.model)) return undefined
+      const info = yield* provider.getProvider(input.model.providerID)
+      const apiKey = openAIAPIKey(info)
+      if (!apiKey) return undefined
+
+      const options = ProviderTransform.options({
+        model: input.model,
+        sessionID: input.sessionID,
+        providerOptions: info.options,
+      })
+      const modelMessages = yield* MessageV2.toModelMessagesEffect(input.messages, input.model, {
+        stripMedia: true,
+        toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
+      })
+      const body = yield* OpenAIResponses.compactBody(
+        LLMNative.request({
+          model: input.model,
+          apiKey,
+          baseURL: openAIBaseURL(info, input.model),
+          messages: ProviderTransform.message(modelMessages, input.model, options),
+          providerOptions: ProviderTransform.providerOptions(input.model, options),
+          headers: { ...providerHeaders(info.options.headers), ...input.model.headers },
+        }),
+      )
+      const url = compactEndpoint(openAIBaseURL(info, input.model))
+      const response = yield* Effect.tryPromise({
+        try: () =>
+          providerFetch(info.options.fetch)(url, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              authorization: `Bearer ${apiKey}`,
+              ...providerHeaders(info.options.headers),
+              ...input.model.headers,
+            },
+            body: JSON.stringify(body),
+          }),
+        catch: (error) => new Error(`OpenAI Responses compaction request failed: ${String(error)}`),
+      })
+      const text = yield* Effect.tryPromise({
+        try: () => response.text(),
+        catch: (error) => new Error(`OpenAI Responses compaction response read failed: ${String(error)}`),
+      })
+      if (!response.ok) {
+        return yield* Effect.fail(
+          new Error(`OpenAI Responses compaction failed (${response.status} ${response.statusText}): ${text}`),
+        )
+      }
+      return yield* decodeCompactResponseText(text)
+    })
+
+    const finishOpenAIResponsesCompaction = Effect.fn("SessionCompaction.finishOpenAIResponsesCompaction")(function* (input: {
+      parentID: MessageID
+      sessionID: SessionID
+      userMessage: MessageV2.User
+      model: Provider.Model
+      compactionPart: MessageV2.CompactionPart | undefined
+      compacted: OpenAIResponses.OpenAIResponsesCompactResponse
+      auto: boolean
+      overflow?: boolean
+      replay?: { info: MessageV2.User; parts: MessageV2.Part[] }
+    }) {
+      const usage = Session.getUsage({ model: input.model, usage: compactUsage(input.compacted) })
+      const message: MessageV2.Assistant = yield* createSummaryMessage(input)
+      message.cost = usage.cost
+      message.tokens = usage.tokens
+      message.finish = "stop"
+      message.time.completed = Date.now()
+      yield* session.updateMessage(message)
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        messageID: message.id,
+        sessionID: input.sessionID,
+        type: "reasoning",
+        text: "",
+        metadata: {
+          openai: {
+            compactionOutput: input.compacted.output,
+          },
+        },
+        time: { start: Date.now(), end: Date.now() },
+      })
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        reason: "stop",
+        messageID: message.id,
+        sessionID: input.sessionID,
+        type: "step-finish",
+        tokens: usage.tokens,
+        cost: usage.cost,
+      })
+      if (input.compactionPart) {
+        yield* session.updatePart({
+          ...input.compactionPart,
+          method: "openai_responses",
+          tail_start_id: undefined,
+        })
+      }
+      yield* autoContinue(input)
+      yield* publishCompacted({
+        sessionID: input.sessionID,
+        summary: OPENAI_RESPONSES_COMPACTION_TEXT,
+        include: undefined,
+      })
+      return "continue" as const
+    })
+
     const processCompaction = Effect.fn("SessionCompaction.process")(function* (input: {
       parentID: MessageID
       messages: MessageV2.WithParts[]
@@ -400,6 +701,32 @@ export const layer = Layer.effect(
         { sessionID: input.sessionID },
         { context: [], prompt: undefined },
       )
+      if (cfg.compaction?.openai_responses) {
+        const compacted = yield* runOpenAIResponsesCompaction({
+          sessionID: input.sessionID,
+          messages: history.filter((_, index) => !hidden.has(index)),
+          model,
+        }).pipe(
+          Effect.catch((error: unknown) =>
+            Effect.sync(() => log.warn("OpenAI Responses compaction failed; falling back", { error })).pipe(
+              Effect.as(undefined),
+            ),
+          ),
+        )
+        if (compacted) {
+          return yield* finishOpenAIResponsesCompaction({
+            parentID: input.parentID,
+            sessionID: input.sessionID,
+            userMessage,
+            model,
+            compactionPart,
+            compacted,
+            auto: input.auto,
+            overflow: input.overflow,
+            replay,
+          })
+        }
+      }
       const nextPrompt = compacting.prompt ?? buildPrompt({ previousSummary, context: compacting.context })
       const msgs = structuredClone(selected.head)
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
@@ -407,34 +734,7 @@ export const layer = Layer.effect(
         stripMedia: true,
         toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
       })
-      const ctx = yield* InstanceState.context
-      const msg: MessageV2.Assistant = {
-        id: MessageID.ascending(),
-        role: "assistant",
-        parentID: input.parentID,
-        sessionID: input.sessionID,
-        mode: "compaction",
-        agent: "compaction",
-        variant: userMessage.model.variant,
-        summary: true,
-        path: {
-          cwd: ctx.directory,
-          root: ctx.worktree,
-        },
-        cost: 0,
-        tokens: {
-          output: 0,
-          input: 0,
-          reasoning: 0,
-          cache: { read: 0, write: 0 },
-        },
-        modelID: model.id,
-        providerID: model.providerID,
-        time: {
-          created: Date.now(),
-        },
-      }
-      yield* session.updateMessage(msg)
+      const msg = yield* createSummaryMessage({ parentID: input.parentID, sessionID: input.sessionID, userMessage, model })
       const processor = yield* processors.create({
         assistantMessage: msg,
         sessionID: input.sessionID,
@@ -474,88 +774,14 @@ export const layer = Layer.effect(
         })
       }
 
-      if (result === "continue" && input.auto) {
-        if (replay) {
-          const original = replay.info
-          const replayMsg = yield* session.updateMessage({
-            id: MessageID.ascending(),
-            role: "user",
-            sessionID: input.sessionID,
-            time: { created: Date.now() },
-            agent: original.agent,
-            model: original.model,
-            format: original.format,
-            tools: original.tools,
-            system: original.system,
-          })
-          for (const part of replay.parts) {
-            if (part.type === "compaction") continue
-            const replayPart =
-              part.type === "file" && MessageV2.isMedia(part.mime)
-                ? { type: "text" as const, text: `[Attached ${part.mime}: ${part.filename ?? "file"}]` }
-                : part
-            yield* session.updatePart({
-              ...replayPart,
-              id: PartID.ascending(),
-              messageID: replayMsg.id,
-              sessionID: input.sessionID,
-            })
-          }
-        }
-
-        if (!replay) {
-          const info = yield* provider.getProvider(userMessage.model.providerID)
-          if (
-            (yield* plugin.trigger(
-              "experimental.compaction.autocontinue",
-              {
-                sessionID: input.sessionID,
-                agent: userMessage.agent,
-                model: yield* provider
-                  .getModel(userMessage.model.providerID, userMessage.model.modelID)
-                  .pipe(Effect.orDie),
-                provider: {
-                  source: info.source,
-                  info,
-                  options: info.options,
-                },
-                message: userMessage,
-                overflow: input.overflow === true,
-              },
-              { enabled: true },
-            )).enabled
-          ) {
-            const continueMsg = yield* session.updateMessage({
-              id: MessageID.ascending(),
-              role: "user",
-              sessionID: input.sessionID,
-              time: { created: Date.now() },
-              agent: userMessage.agent,
-              model: userMessage.model,
-            })
-            const text =
-              (input.overflow
-                ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
-                : "") +
-              "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
-            yield* session.updatePart({
-              id: PartID.ascending(),
-              messageID: continueMsg.id,
-              sessionID: input.sessionID,
-              type: "text",
-              // Internal marker for auto-compaction followups so provider plugins
-              // can distinguish them from manual post-compaction user prompts.
-              // This is not a stable plugin contract and may change or disappear.
-              metadata: { compaction_continue: true },
-              synthetic: true,
-              text,
-              time: {
-                start: Date.now(),
-                end: Date.now(),
-              },
-            })
-          }
-        }
+      if (result === "continue") {
+        yield* autoContinue({
+          sessionID: input.sessionID,
+          userMessage,
+          auto: input.auto,
+          overflow: input.overflow,
+          replay,
+        })
       }
 
       if (processor.message.error) return "stop"
@@ -568,15 +794,7 @@ export const layer = Layer.effect(
             parts: [],
           },
         )
-        if (flags.experimentalEventSystem) {
-          yield* events.publish(SessionEvent.Compaction.Ended, {
-            sessionID: input.sessionID,
-            timestamp: DateTime.makeUnsafe(Date.now()),
-            text: summary ?? "",
-            include: selected.tail_start_id,
-          })
-        }
-        yield* bus.publish(Event.Compacted, { sessionID: input.sessionID })
+        yield* publishCompacted({ sessionID: input.sessionID, summary, include: selected.tail_start_id })
       }
       return result
     })

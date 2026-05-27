@@ -62,6 +62,14 @@ const OpenAIResponsesItemReference = Schema.Struct({
   id: Schema.String,
 })
 
+const OpenAIResponsesCompactOutputItem = Schema.StructWithRest(
+  Schema.Struct({
+    type: Schema.String,
+  }),
+  [Schema.Record(Schema.String, Schema.Unknown)],
+)
+type OpenAIResponsesCompactOutputItem = Schema.Schema.Type<typeof OpenAIResponsesCompactOutputItem>
+
 // `function_call_output.output` accepts either a plain string or an ordered
 // array of content items so tools can return images in addition to text.
 // https://platform.openai.com/docs/api-reference/responses/object
@@ -89,6 +97,7 @@ const OpenAIResponsesInputItem = Schema.Union([
     call_id: Schema.String,
     output: OpenAIResponsesFunctionCallOutput,
   }),
+  OpenAIResponsesCompactOutputItem,
 ])
 type OpenAIResponsesInputItem = Schema.Schema.Type<typeof OpenAIResponsesInputItem>
 
@@ -150,6 +159,14 @@ const OpenAIResponsesBody = Schema.Struct({
 })
 export type OpenAIResponsesBody = Schema.Schema.Type<typeof OpenAIResponsesBody>
 
+export const OpenAIResponsesCompactBody = Schema.Struct({
+  model: Schema.String,
+  input: Schema.Array(OpenAIResponsesInputItem),
+  instructions: Schema.optional(Schema.String),
+  prompt_cache_key: Schema.optional(Schema.String),
+})
+export type OpenAIResponsesCompactBody = Schema.Schema.Type<typeof OpenAIResponsesCompactBody>
+
 const OpenAIResponsesWebSocketMessage = Schema.StructWithRest(
   Schema.Struct({
     type: Schema.tag("response.create"),
@@ -168,6 +185,16 @@ const OpenAIResponsesUsage = Schema.Struct({
   total_tokens: Schema.optional(Schema.Number),
 })
 type OpenAIResponsesUsage = Schema.Schema.Type<typeof OpenAIResponsesUsage>
+
+export const OpenAIResponsesCompactResponse = Schema.Struct({
+  id: Schema.String,
+  object: Schema.Literal("response.compaction"),
+  created_at: Schema.Number,
+  output: Schema.Array(OpenAIResponsesCompactOutputItem),
+  usage: Schema.optional(OpenAIResponsesUsage),
+})
+export type OpenAIResponsesCompactResponse = Schema.Schema.Type<typeof OpenAIResponsesCompactResponse>
+export const decodeCompactResponse = Schema.decodeUnknownEffect(OpenAIResponsesCompactResponse)
 
 const OpenAIResponsesStreamItem = Schema.Struct({
   type: Schema.String,
@@ -273,10 +300,21 @@ const lowerToolCall = (part: ToolCallPart): OpenAIResponsesInputItem => ({
   arguments: ProviderShared.encodeJson(part.input),
 })
 
-const lowerReasoning = (part: ReasoningPart): OpenAIResponsesReasoningInput | undefined => {
+const decodeCompactionOutput = ProviderShared.validateWith(
+  Schema.decodeUnknownEffect(Schema.Array(OpenAIResponsesCompactOutputItem)),
+)
+
+const lowerReasoning = Effect.fn("OpenAIResponses.lowerReasoning")(function* (
+  part: ReasoningPart,
+) {
   const openai = part.providerMetadata?.openai
-  if (!ProviderShared.isRecord(openai) || typeof openai.itemId !== "string" || openai.itemId.length === 0)
-    return undefined
+  if (!ProviderShared.isRecord(openai)) return undefined
+  if (Array.isArray(openai.compactionOutput))
+    return {
+      type: "compaction-output" as const,
+      items: yield* decodeCompactionOutput(openai.compactionOutput),
+    }
+  if (typeof openai.itemId !== "string" || openai.itemId.length === 0) return undefined
   const encryptedContent =
     typeof openai.reasoningEncryptedContent === "string"
       ? openai.reasoningEncryptedContent
@@ -284,12 +322,17 @@ const lowerReasoning = (part: ReasoningPart): OpenAIResponsesReasoningInput | un
         ? null
         : undefined
   return {
-    type: "reasoning",
-    id: openai.itemId,
-    summary: part.text.length > 0 ? [{ type: "summary_text", text: part.text }] : [],
-    encrypted_content: encryptedContent,
+    type: "reasoning" as const,
+    items: [
+      {
+        type: "reasoning" as const,
+        id: openai.itemId,
+        summary: part.text.length > 0 ? [{ type: "summary_text" as const, text: part.text }] : [],
+        encrypted_content: encryptedContent,
+      },
+    ],
   }
-}
+})
 
 const lowerUserContent = Effect.fn("OpenAIResponses.lowerUserContent")(function* (
   part: LLMRequest["messages"][number]["content"][number],
@@ -351,22 +394,27 @@ const lowerMessages = Effect.fn("OpenAIResponses.lowerMessages")(function* (requ
         }
         if (part.type === "reasoning") {
           flushText()
-          const reasoning = lowerReasoning(part)
-          if (!reasoning) continue
-          if (store !== false && reasoning.id) {
-            if (!reasoningReferences.has(reasoning.id)) input.push({ type: "item_reference", id: reasoning.id })
-            reasoningReferences.add(reasoning.id)
+          const lowered = yield* lowerReasoning(part)
+          if (!lowered) continue
+          if (lowered.type === "compaction-output") {
+            input.push(...lowered.items)
             continue
           }
-          const existing = reasoningItems[reasoning.id]
-          if (existing) {
-            existing.summary.push(...reasoning.summary)
-            if (typeof reasoning.encrypted_content === "string")
-              existing.encrypted_content = reasoning.encrypted_content
-            continue
+          for (const item of lowered.items) {
+            if (store !== false && item.id) {
+              if (!reasoningReferences.has(item.id)) input.push({ type: "item_reference", id: item.id })
+              reasoningReferences.add(item.id)
+              continue
+            }
+            const existing = reasoningItems[item.id]
+            if (existing) {
+              existing.summary.push(...item.summary)
+              if (typeof item.encrypted_content === "string") existing.encrypted_content = item.encrypted_content
+              continue
+            }
+            reasoningItems[item.id] = item
+            input.push(item)
           }
-          reasoningItems[reasoning.id] = reasoning
-          input.push(reasoning)
           continue
         }
         if (part.type === "tool-call") {
@@ -425,6 +473,15 @@ const lowerOptions = Effect.fn("OpenAIResponses.lowerOptions")(function* (reques
   }
 })
 
+const lowerCompactOptions = (request: LLMRequest) => {
+  const instructions = OpenAIOptions.instructions(request)
+  const promptCacheKey = OpenAIOptions.promptCacheKey(request)
+  return {
+    ...(instructions ? { instructions } : {}),
+    ...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}),
+  }
+}
+
 const fromRequest = Effect.fn("OpenAIResponses.fromRequest")(function* (request: LLMRequest) {
   const generation = request.generation
   return {
@@ -438,6 +495,14 @@ const fromRequest = Effect.fn("OpenAIResponses.fromRequest")(function* (request:
     top_p: generation?.topP,
     ...(yield* lowerOptions(request)),
   }
+})
+
+export const compactBody = Effect.fn("OpenAIResponses.compactBody")(function* (request: LLMRequest) {
+  return {
+    model: request.model.id,
+    input: yield* lowerMessages(request),
+    ...lowerCompactOptions(request),
+  } satisfies OpenAIResponsesCompactBody
 })
 
 // =============================================================================
