@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@meglinge/megcode",
+  "version": "0.0.0",
+  "description": "megcode CLI installer, powered by opencode builds",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "megcode": "./bin/megcode.js"
+  },
+  "files": [
+    "bin/megcode.js",
+    "install.js",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node ./install.js"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/meglinge/opencode.git",
+    "directory": "npm/megcode"
+  }
+}

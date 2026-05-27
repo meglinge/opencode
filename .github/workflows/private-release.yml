@@ -55,3 +55,17 @@ jobs:
           OPENCODE_RELEASE: private
           OPENCODE_VERSION: ${{ steps.version.outputs.version }}
         run: ./packages/opencode/script/build.ts
+
+      - name: Publish megcode npm package
+        working-directory: npm/megcode
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          MEGCODE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN repository secret is required to publish @meglinge/megcode"
+            exit 1
+          fi
+          npm version "$MEGCODE_VERSION" --no-git-tag-version
+          printf "//registry.npmjs.org/:_authToken=%s\n" "$NODE_AUTH_TOKEN" > ~/.npmrc
+          npm publish --access public
