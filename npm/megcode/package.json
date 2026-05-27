@@ -6,7 +6,7 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "megcode": "./bin/megcode.js"
+    "megcode": "bin/megcode.js"
   },
   "files": [
     "bin/megcode.js",
@@ -22,7 +22,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/meglinge/opencode.git",
+    "url": "git+https://github.com/meglinge/opencode.git",
     "directory": "npm/megcode"
   }
 }
