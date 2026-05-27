@@ -122,6 +122,18 @@ describe("plugin.codex", () => {
     })
   })
 
+  test("exposes ASXS API key method with OpenAI-compatible base URL", async () => {
+    const hooks = await CodexAuthPlugin({} as never)
+    const method = hooks.auth!.methods.find((item) => item.label === "ASXS enter API KEY")
+    expect(method).toEqual({ type: "api", label: "ASXS enter API KEY", metadata: { baseURL: "https://api.asxs.top/v1" } })
+
+    const loaded = await hooks.auth!.loader!(
+      async () => ({ type: "api", key: "test-key", metadata: { baseURL: "https://api.asxs.top/v1" } }) as never,
+      {} as never,
+    )
+    expect(loaded.baseURL).toBe("https://api.asxs.top/v1")
+  })
+
   test("deduplicates concurrent Codex token refreshes", async () => {
     let auth = {
       type: "oauth" as const,

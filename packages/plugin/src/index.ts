@@ -122,6 +122,7 @@ export type AuthHook = {
     | {
         type: "api"
         label: string
+        metadata?: Record<string, string>
         prompts?: Array<
           | {
               type: "text"

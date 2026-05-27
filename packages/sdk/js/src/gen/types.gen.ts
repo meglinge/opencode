@@ -1528,6 +1528,9 @@ export type Provider = {
 export type ProviderAuthMethod = {
   type: "oauth" | "api"
   label: string
+  metadata?: {
+    [key: string]: string
+  }
 }
 
 export type ProviderAuthAuthorization = {

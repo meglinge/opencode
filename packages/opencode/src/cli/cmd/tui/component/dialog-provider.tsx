@@ -203,11 +203,11 @@ export function createDialogProviderOptions() {
               }
             }
             if (method.type === "api") {
-              let metadata: Record<string, string> | undefined
+              let metadata = method.metadata
               if (method.prompts?.length) {
                 const value = await PromptsMethod({ dialog, prompts: method.prompts })
                 if (!value) return
-                metadata = value
+                metadata = { ...metadata, ...value }
               }
               return dialog.replace(() => (
                 <ApiMethod providerID={providerID} title={method.label} metadata={metadata} />

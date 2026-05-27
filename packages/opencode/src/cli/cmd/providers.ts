@@ -175,7 +175,8 @@ const handlePluginAuth = Effect.fn("Cli.providers.pluginAuth")(function* (
     })
     const apiKey = yield* promptValue(key)
 
-    const metadata = Object.keys(inputs).length ? { metadata: inputs } : {}
+    const methodMetadata = { ...(method.metadata ?? {}), ...inputs }
+    const metadata = Object.keys(methodMetadata).length ? { metadata: methodMetadata } : {}
     const authorizeApi = method.authorize
     if (!authorizeApi) {
       yield* put(provider, {
@@ -193,7 +194,7 @@ const handlePluginAuth = Effect.fn("Cli.providers.pluginAuth")(function* (
     }
     if (result.type === "success") {
       const saveProvider = result.provider ?? provider
-      const merged = { ...(metadata.metadata ?? {}), ...(result.metadata ?? {}) }
+      const merged = { ...methodMetadata, ...(result.metadata ?? {}) }
       yield* put(saveProvider, {
         type: "api",
         key: result.key ?? apiKey,

@@ -11,6 +11,7 @@ const log = Log.create({ service: "plugin.codex" })
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 const ISSUER = "https://auth.openai.com"
 const CODEX_API_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
+const ASXS_BASE_URL = "https://api.asxs.top/v1"
 const OAUTH_PORT = 1455
 const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000
 const ALLOWED_MODELS = new Set([
@@ -410,6 +411,7 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
       provider: "openai",
       async loader(getAuth) {
         const auth = await getAuth()
+        if (auth.type === "api") return auth.metadata?.baseURL ? { baseURL: auth.metadata.baseURL } : {}
         if (auth.type !== "oauth") return {}
 
         let refreshPromise:
@@ -631,6 +633,11 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
         {
           label: "Manually enter API Key",
           type: "api",
+        },
+        {
+          label: "ASXS enter API KEY",
+          type: "api",
+          metadata: { baseURL: ASXS_BASE_URL },
         },
       ],
     },

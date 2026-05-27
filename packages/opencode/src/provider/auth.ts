@@ -40,6 +40,7 @@ const Prompt = Schema.Union([TextPrompt, SelectPrompt])
 export class Method extends Schema.Class<Method>("ProviderAuthMethod")({
   type: Schema.Literals(["oauth", "api"]),
   label: Schema.String,
+  metadata: optionalOmitUndefined(Schema.Record(Schema.String, Schema.String)),
   prompts: optionalOmitUndefined(Schema.Array(Prompt)),
 }) {}
 
@@ -134,6 +135,7 @@ export const layer: Layer.Layer<Service, never, Auth.Service | Plugin.Service> =
           item.methods.map((method) => ({
             type: method.type,
             label: method.label,
+            ...(method.type === "api" && method.metadata && { metadata: method.metadata }),
             ...(method.prompts && {
               prompts: method.prompts.map((prompt) => {
                 if (prompt.type === "select") {

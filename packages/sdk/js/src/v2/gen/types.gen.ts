@@ -1734,6 +1734,9 @@ export type PermissionNotFoundError = {
 export type ProviderAuthMethod = {
   type: "oauth" | "api"
   label: string
+  metadata?: {
+    [key: string]: string
+  }
   prompts?: Array<
     | {
         type: "text"
